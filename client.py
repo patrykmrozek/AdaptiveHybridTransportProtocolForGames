@@ -1,7 +1,8 @@
 import asyncio
 import json
 import random
-from typing import Optional
+import time
+from typing import Optional, Dict
 
 try:
     import uvloop
@@ -15,90 +16,165 @@ from aioquic.quic.connection import QuicConnection
 from aioquic.quic.events import (
     DatagramFrameReceived,
     StreamDataReceived,
-    ConnectionTerminated,
-    ProtocolNegotiated,
     HandshakeCompleted,
 )
 
 ALPN = "game/1"
+RELIABLE_CHANNEL = 0  # Used for Stream Data (Critical State)
+UNRELIABLE_CHANNEL = 1  # Used for Datagrams (Movement)
 
 def make_dgram(msg_type: int, channel: int, seq: int, payload: bytes) -> bytes:
+    # Header: MsgType(1B), Channel(1B), Seq(2B) + Payload
     return bytes([msg_type & 0xFF, channel & 0xFF]) + seq.to_bytes(2, "big") + payload
+
+def make_reliable_data(seq: int, payload: dict) -> bytes:
+    # Application-layer reliable packet structure for state updates
+    return json.dumps({
+        "type": "state_update",
+        "channel": RELIABLE_CHANNEL,
+        "seq": seq,
+        "ts": time.time(),  # Sender timestamp for RTT calculation
+        "data": payload,
+    }).encode()
 
 class GameClientProtocol:
     """
-    Thin wrapper so we can await on events and send periodically.
+    Thin wrapper (gameNetAPI) to send data via reliable (Stream) and unreliable (Datagram) channels.
     """
 
     def __init__(self, endpoint):
         self.endpoint = endpoint
         self.quic: QuicConnection = endpoint._quic
-        self.seq_by_channel = {}
+        self.seq_by_channel = {RELIABLE_CHANNEL: -1, UNRELIABLE_CHANNEL: -1}
+        self.ctrl_stream_id: Optional[int] = None
 
     def next_seq(self, channel: int) -> int:
         s = self.seq_by_channel.get(channel, -1) + 1
         self.seq_by_channel[channel] = s
         return s
+    
+    # --- Client Methods (API) ---
+
+    def send_reliable_state(self):
+        """Send a reliable, sequenced game state update."""
+        if self.ctrl_stream_id is None:
+            self.ctrl_stream_id = self.quic.get_next_available_stream_id(is_unidirectional=False)
+            
+        seq = self.next_seq(RELIABLE_CHANNEL)
+        critical_state = make_reliable_data(
+            seq=seq,
+            payload={"player_id": 1, "score": random.randint(0, 100)}
+        )
+        self.quic.send_stream_data(self.ctrl_stream_id, critical_state, end_stream=False)
+        self.endpoint.transmit()
+        print(f"[client] [Reliable] SENT: Seq={seq}, Size={len(critical_state)}, TS={time.time():.4f}")
+
+
+    def send_unreliable_movement(self):
+        """Send an unreliable, sequenced movement update."""
+        x = random.uniform(-10, 10)
+        y = random.uniform(-10, 10)
+        # Include timestamp in payload for One-Way Latency (OWL) calculation
+        payload = f"pos:{x:.2f},{y:.2f},ts:{time.time():.4f}".encode() 
+        seq = self.next_seq(UNRELIABLE_CHANNEL)
+        datagram = make_dgram(msg_type=1, channel=UNRELIABLE_CHANNEL, seq=seq, payload=payload)
+        self.quic.send_datagram_frame(datagram)
+        self.endpoint.transmit()
+        print(f"[client] [Unreliable] SENT: Seq={seq}, Size={len(datagram)}")
+
+    
 
     async def run(self):
-        # Open a reliable stream for control/critical state
-        ctrl_stream = self.quic.get_next_available_stream_id(is_unidirectional=False)
-        hello = json.dumps({"type": "client_hello"}).encode()
-        self.quic.send_stream_data(ctrl_stream, hello, end_stream=False)
+        # Initial reliable hello for connection setup
+        if self.ctrl_stream_id is None:
+            self.ctrl_stream_id = self.quic.get_next_available_stream_id(is_unidirectional=False)
+            hello = json.dumps({"type": "client_hello"}).encode()
+            self.quic.send_stream_data(self.ctrl_stream_id, hello, end_stream=False)
+            self.endpoint.transmit()
+
+        
+        recv_task = asyncio.create_task(self._recv_loop())
+        # Part f Randomized sending loop
+        mixed_task = asyncio.create_task(self._mixed_loop(reliable_hz=5, unreliable_hz=30)) 
+
+        await asyncio.sleep(10)  
+        recv_task.cancel()
+        mixed_task.cancel()
+        
+        self.quic.close()
         self.endpoint.transmit()
 
-        # Start two background tasks: receive loop (events) and movement tick loop
-        recv_task = asyncio.create_task(self._recv_loop())
-        move_task = asyncio.create_task(self._movement_loop(channel=1, hz=30))
-
-        await asyncio.sleep(5)  # demo runtime
-        recv_task.cancel()
-        move_task.cancel()
-
     async def _recv_loop(self):
-        """
-        aioquic delivers events to the `endpoint` object internally, but we can
-        await the connection to go idle to force flushes. In practice, you’d
-        subclass QuicConnectionProtocol; here we just keep the connection open.
-        """
+        """Keeps the connection alive and flushes QUIC events."""
         try:
             while True:
                 await asyncio.sleep(0.05)
         except asyncio.CancelledError:
             pass
 
-    async def _movement_loop(self, channel: int, hz: int = 30):
+    async def _mixed_loop(self, reliable_hz: int = 5, unreliable_hz: int = 30):
         """
-        Send movement updates via QUIC DATAGRAM at fixed rate.
+        Sends data randomly across both channels.(not a fixed rate)
         """
-        period = 1.0 / hz
+        reliable_period = 1.0 / reliable_hz
+        unreliable_period = 1.0 / unreliable_hz
+        
+        last_reliable_send = 0.0
+        last_unreliable_send = 0.0
+
         try:
             while True:
-                await asyncio.sleep(period)
-                x = random.uniform(-10, 10)
-                y = random.uniform(-10, 10)
-                payload = f"pos:{x:.2f},{y:.2f}".encode()
-                seq = self.next_seq(channel)
-                self.quic.send_datagram_frame(make_dgram(1, channel, seq, payload))
-                self.endpoint.transmit()
+                now = time.time()
+                
+                # Check for reliable send opportunity
+                if now - last_reliable_send >= reliable_period:
+                    # Randomly decide to send reliable (e.g., 50% chance when available)
+                    if random.random() < 0.5:
+                        self.send_reliable_state()
+                        last_reliable_send = now
+                
+                # Check for unreliable send opportunity (higher rate)
+                if now - last_unreliable_send >= unreliable_period:
+                    self.send_unreliable_movement()
+                    last_unreliable_send = now
+                    
+                await asyncio.sleep(min(reliable_period, unreliable_period) / 2)
+                
         except asyncio.CancelledError:
             pass
 
 class ClientEvents(QuicConnectionProtocol):
     """
-    If you want to *receive* reliable/unreliable from the server, handle it here.
+    Handles events from the server and logs RTT part g
     """
     def quic_event_received(self, event) -> None:
         if isinstance(event, HandshakeCompleted):
-            # ready to send; GameClientProtocol will do that
+            # ready to send;
             pass
         elif isinstance(event, StreamDataReceived):
-            # Reliable data from server
-            # print("STREAM RX:", event.stream_id, event.data)
-            pass
+            # Reliable data from server (echo ACK from server)
+            rx_ts = time.time()
+            try:
+                data_str = event.data.decode()
+                if not data_str.startswith("ack:"):
+                    return
+                
+                # Parse the echoed reliable packet to get the original timestamp
+                original_packet = json.loads(data_str[4:])
+                
+                # Calculate RTT based on sender's original timestamp
+                sent_ts = original_packet.get("ts", rx_ts)
+                rtt = (rx_ts - sent_ts) * 1000  # RTT in milliseconds
+                
+                # (Requirement g) RTT Logging
+                print(f"[client] [Reliable] ACK RX: AppSeq={original_packet.get('seq')}, RTT={rtt:.2f}ms")
+            except Exception:
+                # Handle initial client_hello ACK or malformed data
+                if "client_hello" not in data_str:
+                    print(f"[client] [Reliable] Data RX: {event.data!r}")
+
         elif isinstance(event, DatagramFrameReceived):
             # Unreliable from server
-            # print("DGRAM RX:", event.data[:16])
             pass
 
 async def main(host: str = "127.0.0.1", port: int = 4433):
@@ -106,7 +182,7 @@ async def main(host: str = "127.0.0.1", port: int = 4433):
         is_client=True,
         alpn_protocols=[ALPN],
     )
-    # In dev, skip certificate validation (don’t do this in prod)
+    # In dev, skip certificate validation (don't do this in prod)
     cfg.verify_mode = False
     cfg.max_datagram_frame_size = 1200
 
