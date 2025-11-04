@@ -1,6 +1,7 @@
-# server.py
 import asyncio
 import json
+import time
+from typing import Dict, Any, List, Tuple
 
 try:
     import uvloop
@@ -17,6 +18,7 @@ from aioquic.quic.events import (
 )
 
 ALPN = "game/1"
+RELIABLE_TIMEOUT_MS = 200  # T milliseconds threshold
 
 def make_server_cfg() -> QuicConfiguration:
     cfg = QuicConfiguration(is_client=False, alpn_protocols=[ALPN])
@@ -26,28 +28,142 @@ def make_server_cfg() -> QuicConfiguration:
     return cfg
 
 class GameServer(QuicConnectionProtocol):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Application-layer buffer for reliable packets {app_seq: (timestamp_rx, data_bytes)}
+        self.reliable_buffer: Dict[int, Tuple[float, bytes]] = {}
+        self.next_expected_seq = 0
+        self.flush_task: Optional[asyncio.Task] = None
+
+    def connection_made(self, transport):
+        super().connection_made(transport)
+        # Part e background task to flush the reliable packet buffer RDT
+        self.flush_task = asyncio.create_task(self._flush_reliable_data())
+
+    def connection_lost(self, exc):
+        super().connection_lost(exc)
+        if self.flush_task:
+            self.flush_task.cancel()
+
+    async def _flush_reliable_data(self):
+        
+        try:
+            while True:
+                await asyncio.sleep(0.01)  # Check frequently
+                now = time.time()
+                skipped_this_cycle = False
+                
+                if self.next_expected_seq not in self.reliable_buffer:
+                    next_available_seq = self.next_expected_seq + 1
+                    
+                    if next_available_seq in self.reliable_buffer:
+                         (rx_ts, _) = self.reliable_buffer[next_available_seq]
+                         time_waiting = (now - rx_ts) * 1000
+
+                         if time_waiting > RELIABLE_TIMEOUT_MS:
+                            
+                            print(f"[server] ⚠️ RELIABLE SKIP: Seq={self.next_expected_seq} skipped. Next Seq={next_available_seq} waited for {time_waiting:.2f}ms > {RELIABLE_TIMEOUT_MS}ms.")
+                            self.next_expected_seq += 1
+                            skipped_this_cycle = True
+                            continue
+
+                
+                while self.next_expected_seq in self.reliable_buffer:
+                    rx_ts, data_bytes = self.reliable_buffer.pop(self.next_expected_seq)
+                    try:
+                        
+                        packet = json.loads(data_bytes.decode())
+                        
+                        # one-way latency OWL
+                        sent_ts = packet.get("ts", now)
+                        owl_ms = (rx_ts - sent_ts) * 1000
+                        
+                        # Logging
+                        print(f"[server] ✅ RELIABLE RX: Seq={self.next_expected_seq}, OWL={owl_ms:.2f}ms, Data={packet.get('data')}")
+                        
+                        # Echo ACK for RTT calculation on client side
+                        self._quic.send_stream_data(self._quic.get_next_available_stream_id(is_unidirectional=False), b"ack:" + data_bytes, end_stream=False)
+                        self.transmit()
+
+                    except Exception as e:
+                        print(f"[server] Error processing reliable packet: {e}")
+                    
+                    self.next_expected_seq += 1
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"[server] Flush task error: {e}")
+
+
     def quic_event_received(self, event) -> None:
         if isinstance(event, HandshakeCompleted):
             peer = self._quic._peer_address if hasattr(self._quic, "_peer_address") else "<peer>"
             print(f"[server] Handshake completed with {peer}")
-            # Send a reliable hello on a fresh bidirectional stream
+            # Send initial reliable hello on a fresh bidirectional stream
             stream_id = self._quic.get_next_available_stream_id(is_unidirectional=False)
             self._quic.send_stream_data(stream_id, json.dumps({"type": "server_hello"}).encode(), end_stream=False)
             self.transmit()
 
         elif isinstance(event, StreamDataReceived):
-            print(f"[server] STREAM RX id={event.stream_id} len={len(event.data)}")
-            # Echo ack
-            self._quic.send_stream_data(event.stream_id, b"ack:" + event.data, end_stream=False)
-            self.transmit()
+            # buffer here
+            rx_ts = time.time()
+            
+            try:
+                data_str = event.data.decode()
+                if data_str.startswith('{"type": "client_hello"}'):
+                    print(f"[server] [Reliable] Initial client_hello received.")
+                    return
+
+                packet = json.loads(data_str)
+                app_seq = packet.get("seq")
+                
+                if app_seq is not None:
+                    if app_seq < self.next_expected_seq:
+                        print(f"[server] 🔄 [Reliable] RX: Seq={app_seq} (Stale), current expected={self.next_expected_seq}")
+                        return
+                    
+                    # part e buffer 
+                    self.reliable_buffer[app_seq] = (rx_ts, event.data)
+                    
+                    if app_seq > self.next_expected_seq:
+                        # part g: Packet arrived out-of-order 
+                        print(f"[server] ⏳ [Reliable] RX: Seq={app_seq} (O.O.O), Expected={self.next_expected_seq}. Buffering...")
+                    
+                else:
+                    print(f"[server] [Reliable] RX: Unsequenced data: {event.data!r}")
+            
+            except json.JSONDecodeError:
+                print(f"[server] [Reliable] RX: Non-JSON data on stream {event.stream_id}")
+
 
         elif isinstance(event, DatagramFrameReceived):
-            print(f"[server] DGRAM RX len={len(event.data)}, data:{event.data}")
+            # Unreliable from client (Movement data) Part g
+            rx_ts = time.time()
+            
+            # header parse
+            seq = int.from_bytes(event.data[2:4], "big")
+            payload = event.data[4:]
+            
+            try:
+                
+                payload_str = payload.decode()
+                sent_ts_str = payload_str.split("ts:")[1]
+                sent_ts = float(sent_ts_str)
+                
+                owl_ms = (rx_ts - sent_ts) * 1000
+                
+                # Logging
+                print(f"[server] ⏩ [Unreliable] RX: Seq={seq}, OWL={owl_ms:.2f}ms, Data={payload_str.split(',ts:')[0]}")
+            except Exception:
+                print(f"[server] ⏩ [Unreliable] RX: Seq={seq}, Data={payload!r}")
+
 
 async def main(host="0.0.0.0", port=4433):
     cfg = make_server_cfg()
     await serve(host, port, configuration=cfg, create_protocol=GameServer)
     print(f"[server] QUIC listening on {host}:{port} (ALPN={ALPN})")
+    print(f"[server] Reliable data skip threshold (T): {RELIABLE_TIMEOUT_MS} ms.")
     # ⛔️ Keep the server running forever
     await asyncio.Event().wait()
 
