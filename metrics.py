@@ -16,7 +16,7 @@ class RollingStats:
         s = sorted(self.samples)
         #find smaple at pth percentile pos
         def pct(p):
-            p_idx = len(s) - 1 * (p/100)
+            p_idx = (len(s) - 1) * (p/100)
             #split the (i)nteger|(frac)tion
             frac, i = math.modf(p_idx)
             i = int(i)
