@@ -51,7 +51,7 @@ class GameClientProtocol:
         self.ctrl_stream_id: Optional[int] = None
 
         self._start_time = time.time()
-        self._metrics_task = Optional[asyncio.Task()] = None
+        self._metrics_task = Optional[asyncio.Task] = None
         self._inflight: Dict[int, float] = {} #seq: send_ts to calc RTT
 
         self.metrics = {
@@ -107,6 +107,11 @@ class GameClientProtocol:
             seq=seq,
             payload={"player_id": 1, "score": random.randint(0, 100)}
         )
+
+        self.metrics["reliable"]["tx"] += 1
+        self.metrics["reliable"]["bytes_tx"] += len(critical_state)
+        self._inflight[seq] = time.time()
+
         self.quic.send_stream_data(self.ctrl_stream_id, critical_state, end_stream=False)
         self.endpoint.transmit()
         print(f"[client] [Reliable] SENT: Seq={seq}, Size={len(critical_state)}, TS={time.time():.4f}")
