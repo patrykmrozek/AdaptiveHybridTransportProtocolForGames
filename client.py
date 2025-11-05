@@ -2,6 +2,7 @@ import asyncio
 import json
 import random
 import time
+from sys import set_int_max_str_digits
 from typing import Optional, Dict
 from metrics import RollingStats, Jitter
 from dataclasses import dataclass, field
@@ -63,7 +64,7 @@ class GameClientProtocol:
         self._metrics_task: Optional[asyncio.Task] = None
         self._retransmit_task: Optional[asyncio.Task] = None
 
-        self._inflight: Dict[int, Inflight] = {} #seq: send_ts to calc RTT
+        self._inflight: Dict[int, Inflight] = {} #seq: Inflight
         self.srtt_ms: float | None = None  # smooth rtt - estimate
         self.rttvar_ms = 0.0  # variation in RTT
         self.RTO_min_ms = 100  # lowerbound RTO
@@ -89,7 +90,8 @@ class GameClientProtocol:
     def RTO_ms(self):
         if self.srtts_ms is None:
             return 1000
-        return max(self.RTO_min_ms, min(self.RTO_max_ms, int(self.srtts_ms + 4 * self.rttvar_ms)))
+        rto = self.srtt_ms + 4 * self.rttvar_ms
+        return max(self.RTO_min_ms, min(self.RTO_max_ms, int(rto)))
 
     #refines est rtt to adapt to network delay
     def _update_rtt(self, sample_ms):
@@ -201,8 +203,9 @@ class GameClientProtocol:
                             #give up on packet
                             del self._inflight[seq]
                             print(f"[client] Drop seq={seq} after {item.retries} retries")
+                            continue
                         #resend same exact data on same stream - retransmit
-                        self.quic.send_stream_data(self.ctrl_stream_id, item.payload_bytes, end_stream=False)
+                        self.quic.send_stream_data(item.ctrl_stream_id, item.payload_bytes, end_stream=False)
                         self.endpoint.transmit()
                         item.retries += 1
                         item.ts_last_ms = now_ms
@@ -276,9 +279,6 @@ class GameClientProtocol:
         except asyncio.CancelledError:
             pass
 
-    async def retransmit_scheduler(self):
-        pass
-
 class ClientEvents(QuicConnectionProtocol):
     """
     Handles events from the server and logs RTT part g
@@ -303,12 +303,19 @@ class ClientEvents(QuicConnectionProtocol):
 
                     client = getattr(self, "metrics_client", None)
                     if client is not None and seq is not None:
-                        send_ts = client._inflight.pop(seq, sent_ts)
-                        rtt_ms = (rx_ts - send_ts) * 1000
+                        item = client._inflight.pop(seq, None)
+                        if item is not None:
+                            #compare rx_ts with last_ts
+                            rtt_ms = (rx_ts * 1000) - item.ts_last_ms
+                        else:
+                            #fallback
+                            rtt_ms = (rx_ts - sent_ts) * 1000.0
+
                         m = client.metrics["reliable"]
                         m["ack"] += 1
                         m["rtt"].add(rtt_ms)
                         m["jitter"].add(rtt_ms)
+                        client._update_rtt(rtt_ms)
                     else:
                         rtt_ms = (rx_ts - sent_ts) * 1000
                     print(f"[client] [Reliable] ACK RX: AppSeq={seq}, RTT={rtt_ms:.2f}ms")
