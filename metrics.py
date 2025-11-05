@@ -26,3 +26,6 @@ class RollingStats:
             return s[i] * (1-frac) + s[min(i+1, len(s)-1)] * frac
         return {p: pct(p) for p in ps}
 
+    def avg(self):
+        return sum(self.samples) / len(self.samples) if self.samples else float('nan')
+
