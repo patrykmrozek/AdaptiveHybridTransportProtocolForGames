@@ -4,6 +4,7 @@ import random
 import time
 from typing import Optional, Dict
 from metrics import RollingStats, Jitter
+from dataclasses import dataclass, field
 
 try:
     import uvloop
@@ -19,6 +20,14 @@ from aioquic.quic.events import (
     StreamDataReceived,
     HandshakeCompleted,
 )
+
+@dataclass
+class Inflight:
+    payload_bytes: bytes
+    seq: int
+    ts_first_ms: int #time of first send
+    ts_last_ms: int #time of last send
+    retries: int = 0
 
 ALPN = "game/1"
 RELIABLE_CHANNEL = 0  # Used for Stream Data (Critical State)
