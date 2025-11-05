@@ -29,3 +29,20 @@ class RollingStats:
     def avg(self):
         return sum(self.samples) / len(self.samples) if self.samples else float('nan')
 
+
+class Jitter:
+    def __init__(self):
+        self.jitter = 0.0 #jitter estimate
+        self._prev = None #previous transmit time
+        self.lpf = 16.0 #low pass filter (smooths jitter over time - RFC3350)
+
+    def add(self, transmit_ms: float):
+        if self._prev is None:
+            self._prev = transmit_ms
+            return
+        diff = abs(transmit_ms - self._prev)
+        self.jitter += (diff - self.jitter) / self.lpf
+        self._prev = transmit_ms
+
+    def value(self):
+        return self.jitter
