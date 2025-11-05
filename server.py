@@ -99,7 +99,13 @@ class GameServer(QuicConnectionProtocol):
                         
                         # Logging
                         print(f"[server] ✅ RELIABLE RX: Seq={self.next_expected_seq}, OWL={owl_ms:.2f}ms, Data={packet.get('data')}")
-                        
+
+                        metric = self.metrics["reliable"]
+                        metric["rx"] += 1
+                        metric["bytes"] += len(data_bytes)
+                        metric["owl"].add(owl_ms)
+                        metric["jitter"].add(owl_ms)
+
                         # Echo ACK for RTT calculation on client side
                         self._quic.send_stream_data(self._quic.get_next_available_stream_id(is_unidirectional=False), b"ack:" + data_bytes, end_stream=False)
                         self.transmit()
@@ -127,6 +133,7 @@ class GameServer(QuicConnectionProtocol):
         elif isinstance(event, StreamDataReceived):
             # buffer here
             rx_ts = time.time()
+            r_str = "reliable"
             
             try:
                 data_str = event.data.decode()
@@ -136,19 +143,25 @@ class GameServer(QuicConnectionProtocol):
 
                 packet = json.loads(data_str)
                 app_seq = packet.get("seq")
+                pkt_ts = packet.get("ts")
                 
-                if app_seq is not None:
-                    if app_seq < self.next_expected_seq:
-                        print(f"[server] 🔄 [Reliable] RX: Seq={app_seq} (Stale), current expected={self.next_expected_seq}")
-                        return
-                    
-                    # part e buffer 
-                    self.reliable_buffer[app_seq] = (rx_ts, event.data)
-                    
-                    if app_seq > self.next_expected_seq:
-                        # part g: Packet arrived out-of-order 
-                        print(f"[server] ⏳ [Reliable] RX: Seq={app_seq} (O.O.O), Expected={self.next_expected_seq}. Buffering...")
-                    
+                if app_seq is None or pkt_ts is None:
+                    print(f"[server] [Reliable]  RC: missing seq/ts: {packet}.")
+                    return
+
+                if app_seq < self.next_expected_seq:
+                    self.metrics[r_str]["dup"] = self.metrics[r_str].get("dup", 0) + 1
+                    print(f"[server] 🔄 [Reliable] RX: Seq={app_seq}, current expected={self.next_expected_seq}")
+                    return
+
+                # part e buffer
+                self.reliable_buffer[app_seq] = (rx_ts, event.data)
+
+                if app_seq > self.next_expected_seq:
+                    # part g: Packet arrived out-of-order
+                    self.metrics[r_str]["ooo"] += 1
+                    print(f"[server] ⏳ [Reliable] RX: Seq={app_seq} (O.O.O), Expected={self.next_expected_seq}. Buffering...")
+
                 else:
                     print(f"[server] [Reliable] RX: Unsequenced data: {event.data!r}")
             
