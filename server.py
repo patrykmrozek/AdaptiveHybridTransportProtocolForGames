@@ -125,7 +125,7 @@ class GameServer(QuicConnectionProtocol):
                          time_waiting = (now - rx_ts) * 1000
 
                          if time_waiting > RELIABLE_TIMEOUT_MS:
-                            
+                            self.metrics["reliable"]["stale"] += 1
                             print(f"[server] ⚠️ RELIABLE SKIP: Seq={self.next_expected_seq} skipped. Next Seq={next_available_seq} waited for {time_waiting:.2f}ms > {RELIABLE_TIMEOUT_MS}ms.")
                             self.next_expected_seq += 1
                             skipped_this_cycle = True
