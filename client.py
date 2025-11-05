@@ -56,6 +56,10 @@ class GameClientProtocol:
         self._metrics_task: Optional[asyncio.Task] = None
         self._inflight: Dict[int, float] = {} #seq: send_ts to calc RTT
 
+        #storage for server rx counters
+        self._server_unrel_rx = 0
+        self._server_rel_rx = 0
+
         self.metrics = {
             "reliable": {
                 "tx": 0, "ack": 0, "bytes_tx": 0,
@@ -87,7 +91,8 @@ class GameClientProtocol:
 
         u = self.metrics["unreliable"]
         u_tput = u["bytes_tx"] / 1024.0 / dur
-        print(f"[metrics][UNRELIABLE] TX={u['tx']} BytesTX={u['bytes_tx']}")
+        u_pdr = (100.0 * self._server_unrel_rx / max(1, u["tx"]))  # server-RX / client-TX
+        print(f"[metrics][UNRELIABLE] TX={u['tx']} BytesTX={u['bytes_tx']} PDR={u_pdr:.1f}%")
         print(f"Throughput ≈ {u_tput:.2f} kB/s")
         print("[client] --------------------------\n")
 
@@ -219,35 +224,40 @@ class ClientEvents(QuicConnectionProtocol):
             data_str = None
             try:
                 data_str = event.data.decode()
-                if not data_str.startswith("ack:"):
+                if data_str.startswith("ack:"):
+                    # Parse the echoed reliable packet to get the original timestamp
+                    original_packet = json.loads(data_str[4:])
+                    seq = original_packet.get("seq")
+
+                    # Calculate RTT based on sender's original timestamp
+                    sent_ts = float(original_packet.get("ts", rx_ts))
+
+                    client = getattr(self, "metrics_client", None)
+                    if client is not None and seq is not None:
+                        send_ts = client._inflight.pop(seq, sent_ts)
+                        rtt_ms = (rx_ts - send_ts) * 1000
+                        m = client.metrics["reliable"]
+                        m["ack"] += 1
+                        m["rtt"].add(rtt_ms)
+                        m["jitter"].add(rtt_ms)
+                    else:
+                        rtt_ms = (rx_ts - sent_ts) * 1000
+                    print(f"[client] [Reliable] ACK RX: AppSeq={seq}, RTT={rtt_ms:.2f}ms")
                     return
-                
-                # Parse the echoed reliable packet to get the original timestamp
-                original_packet = json.loads(data_str[4:])
-                seq = original_packet.get("seq")
 
-                # Calculate RTT based on sender's original timestamp
-                sent_ts = float(original_packet.get("ts", rx_ts))
+                pkt = json.loads(data_str)
+                if pkt.get("type") == "server_metrics":
+                    client = getattr(self, "metrics_client", None)
+                    if client:
+                        client._server_unrel_rx = int(pkt.get("unrel_rx", 0))
+                        client._server_rel_rx = int(pkt.get("rel_rx", 0))
+                    return
 
-                client = getattr(self, "metrics_client", None)
-                if client is not None and seq is not None:
-                    send_ts = client._inflight.pop(seq, sent_ts)
-                    rtt_ms = (rx_ts - send_ts) * 1000
-                    m = client.metrics["reliable"]
-                    m["ack"] += 1
-                    m["rtt"].add(rtt_ms)
-                    m["jitter"].add(rtt_ms)
-                else:
-                    rtt_ms = (rx_ts - sent_ts) * 1000
-                print(f"[client] [Reliable] ACK RX: AppSeq={seq}, RTT={rtt_ms:.2f}ms")
             except Exception:
                 # Handle initial client_hello ACK or malformed data
-                if "client_hello" not in data_str:
+                if data_str and "client_hello" not in data_str:
                     print(f"[client] [Reliable] Data RX: {event.data!r}")
 
-        elif isinstance(event, DatagramFrameReceived):
-            # Unreliable from server
-            pass
 
 async def main(host: str = "127.0.0.1", port: int = 4433):
     cfg = QuicConfiguration(
