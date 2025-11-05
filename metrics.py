@@ -29,7 +29,7 @@ class RollingStats:
     def avg(self):
         return sum(self.samples) / len(self.samples) if self.samples else float('nan')
 
-
+#jitter estimator following RFC3550
 class Jitter:
     def __init__(self):
         self.jitter = 0.0 #jitter estimate
