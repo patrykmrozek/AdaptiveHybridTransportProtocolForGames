@@ -1,7 +1,7 @@
 import asyncio
 import json
 import time
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 from metrics import RollingStats, Jitter
 
 METRIC_SUMMARY_EVERY_S = 5.0 #how many seconds between esach metric summary
@@ -38,6 +38,8 @@ class GameServer(QuicConnectionProtocol):
         self.next_expected_seq = 0
         self.flush_task: Optional[asyncio.Task] = None
 
+        self._start_time = time.time()
+        self.metrics_task: Optional[asyncio.Task] = None
         #set up metric storage
         self.metrics = {
             "reliable": {
@@ -51,18 +53,61 @@ class GameServer(QuicConnectionProtocol):
                 "rx": 0, "bytes": 0
             }
         }
-        self._last_metrics_print = time.time()
 
+    def _print_metrics_summary(self):
+        now = time.time()
+        print("--METRIC SUMMARY--")
+        for pkt_type in ("reliable", "unreliable"):
+            m = self.metrics[pkt_type]
+            dur = max(1e-6, now - self._start_time)
+            tput = m.get("bytes", 0) / 1024.0 / dur #kB/s
+
+            header = f"[metrics][{pkt_type.upper()}] RX={m.get('rx', 0)} Bytes={m.get('bytes', 0)}"
+            if pkt_type == "reliable":
+                header += (
+                    f" Stale={m.get('stale', 0)}"
+                    f" OOO={m.get('ooo', 0)}"
+                    f" Dup={m.get('dup', 0)}"
+                )
+            print(header)
+
+            owl_stats = m.get("owl")
+            if owl_stats and len(owl_stats.samples) > 0:
+                p = owl_stats.percentiles()
+                avg_owl = owl_stats.avg()
+                jitter_val = m["jitter"].value()
+                print(
+                    f"  OWL(ms): avg={avg_owl:.2f}, "
+                    f"p50={p.get(50, float('nan')):.2f}, "
+                    f"p95={p.get(95, float('nan')):.2f}, "
+                    f"jitter(RFC3550)={jitter_val:.2f}"
+                )
+            else:
+                print("OWL(ms): no samples")
+
+            print("Throughput ≈ {tput:.2f} kB/s}")
+            print("[server] ---\n")
 
     def connection_made(self, transport):
         super().connection_made(transport)
         # Part e background task to flush the reliable packet buffer RDT
         self.flush_task = asyncio.create_task(self._flush_reliable_data())
+        self.metrics_task = asyncio.create_task(self._periodic_metrics_print())
 
     def connection_lost(self, exc):
         super().connection_lost(exc)
         if self.flush_task:
             self.flush_task.cancel()
+        if self.metrics_task:
+            self.metrics_task.cancel()
+
+    async def _periodic_metrics_print(self):
+        try:
+            while True:
+                await asyncio.sleep(METRIC_SUMMARY_EVERY_S)
+                self._print_metrics_summary()
+        except asyncio.CancelledError:
+            pass
 
     async def _flush_reliable_data(self):
         
