@@ -29,6 +29,16 @@ class Inflight:
     ts_last_ms: int #time of last send
     retries: int = 0
 
+#global runtime state
+inflight: dict[int, Inflight] = {} #seq num: packet data
+srtts_ms: float | None = None #smooth rtt - estimate
+rttvar_ms: float | None = None #variation in RTT
+RTO_min_ms = 100 #lowerbound RTO
+RTO_max_ms = 3000 #upperbound RTO
+MAX_RETRIES = 5
+next_seq = 0 #increments 1 each send
+
+
 ALPN = "game/1"
 RELIABLE_CHANNEL = 0  # Used for Stream Data (Critical State)
 UNRELIABLE_CHANNEL = 1  # Used for Datagrams (Movement)
