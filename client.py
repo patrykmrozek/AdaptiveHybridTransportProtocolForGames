@@ -23,10 +23,11 @@ from aioquic.quic.events import (
 
 @dataclass
 class Inflight:
-    payload_bytes: bytes
+    payload_bytes: bytes #exact bytes to resend
+    ctrl_stream_id: int #stream used for send
     seq: int
     ts_first_ms: int #time of first send
-    ts_last_ms: int #time of last send
+    ts_last_ms: int #time of last (re)send
     retries: int = 0
 
 ALPN = "game/1"
@@ -62,9 +63,9 @@ class GameClientProtocol:
         self._metrics_task: Optional[asyncio.Task] = None
         self._retransmit_task: Optional[asyncio.Task] = None
 
-        self._inflight: Dict[int, float] = {} #seq: send_ts to calc RTT
-        self.srtts_ms: float | None = None  # smooth rtt - estimate
-        self.rttvar_ms: float | None = None  # variation in RTT
+        self._inflight: Dict[int, Inflight] = {} #seq: send_ts to calc RTT
+        self.srtt_ms: float | None = None  # smooth rtt - estimate
+        self.rttvar_ms = 0.0  # variation in RTT
         self.RTO_min_ms = 100  # lowerbound RTO
         self.RTO_max_ms = 3000  # upperbound RTO
         self.MAX_RETRIES = 5
@@ -83,11 +84,28 @@ class GameClientProtocol:
             }
         }
 
+    #helpers for rtt and rto calculations
     # returns RTO between min and max defined above, scaled by latency and variability
     def RTO_ms(self):
         if self.srtts_ms is None:
             return 1000
         return max(self.RTO_min_ms, min(self.RTO_max_ms, int(self.srtts_ms + 4 * self.rttvar_ms)))
+
+    #refines est rtt to adapt to network delay
+    def _update_rtt(self, sample_ms):
+        if self.srtt_ms is None:
+            self.srtt_ms = sample_ms
+            self.rttvar_ms = sample_ms / 2.0
+        else:
+            #weights
+            w1 = 1/8
+            w2 = 1/4
+            #update rtt variability
+            self.rttvar_ms = (1-w2) * self.rttvar_ms + w2 * abs(self.srtt_ms - sample_ms)
+           #update rtt est
+            self.srtt_ms = (1-w1) * self.srtt_ms + w1 * sample_ms
+
+
 
     def _print_metrics_summary(self):
         now = time.time()
