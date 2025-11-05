@@ -64,6 +64,32 @@ class GameClientProtocol:
             }
         }
 
+    def _print_metrics_summary(self):
+        now = time.time()
+        dur = max(1e-6, now - self._start_time)
+
+        r = self.metrics["reliable"]
+        r_p = r["rtt"].percentiles()
+        r_tput = r["bytes_tx"] / 1024.0 / dur
+        pdr = 100.0 * r["ack"] / max(1, r["tx"])
+        print("\n[client] 📊 --- METRIC SUMMARY ---")
+        print(f"[metrics][RELIABLE] TX={r['tx']} ACK={r['ack']} PDR={pdr:.1f}% BytesTX={r['bytes_tx']}")
+        if len(r["rtt"].samples) > 0:
+            print(f"RTT(ms): avg={r['rtt'].avg():.2f} "
+                  f"p50={r_p.get(50, float('nan')):.2f} "
+                  f"p95={r_p.get(95, float('nan')):.2f} "
+                  f"jitter(RFC3550)={r['jitter'].value():.2f}")
+        else:
+            print("RTT(ms): No samples yet")
+        print(f"Throughput ≈ {r_tput:.2f} kB/s")
+
+        u = self.metrics["unreliable"]
+        u_tput = u["bytes_tx"] / 1024.0 / dur
+        print(f"[metrics][UNRELIABLE] TX={u['tx']} BytesTX={u['bytes_tx']}")
+        print(f"Throughput ≈ {u_tput:.2f} kB/s")
+        print("[client] --------------------------\n")
+
+
     def next_seq(self, channel: int) -> int:
         s = self.seq_by_channel.get(channel, -1) + 1
         self.seq_by_channel[channel] = s
