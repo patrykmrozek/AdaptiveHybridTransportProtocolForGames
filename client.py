@@ -223,13 +223,16 @@ class GameClientProtocol:
 
         recv_task = asyncio.create_task(self._recv_loop())
         # Part f Randomized sending loop
-        mixed_task = asyncio.create_task(self._mixed_loop(reliable_hz=5, unreliable_hz=30)) 
+        mixed_task = asyncio.create_task(self._mixed_loop(reliable_hz=5, unreliable_hz=30))
+        self._retransmit_task = asyncio.create_task(self.retransmit_scheduler())
 
         await asyncio.sleep(10)  
         recv_task.cancel()
         mixed_task.cancel()
         if self._metrics_task:
             self._metrics_task.cancel()
+        if self._retransmit_task:
+            self._retransmit_task.cancel()
         
         self.quic.close()
         self.endpoint.transmit()
