@@ -185,6 +185,33 @@ class GameClientProtocol:
         self.endpoint.transmit()
         print(f"[client] [Unreliable] SENT: Seq={seq}, Size={len(datagram)}")
 
+    #scans un-acked packets and resends any whose timer expired
+    async def retransmit_scheduler(self):
+        try:
+            while True:
+                if not self._inflight:
+                    await asyncio.sleep(0.01)
+                    continue
+
+                now_ms = int(time.time() * 1000)
+                rto = self.RTO_ms() #read a single RTO
+                for seq, item in list(self._inflight.items()):
+                    if now_ms - item.ts_last_ms >= rto: #if expired
+                        if item.retries >= self.MAX_RETRIES:
+                            #give up on packet
+                            del self._inflight[seq]
+                            print(f"[client] Drop seq={seq} after {item.retries} retries")
+                        #resend same exact data on same stream - retransmit
+                        self.quic.send_stream_data(self.ctrl_stream_id, item.payload_bytes, end_stream=False)
+                        self.endpoint.transmit()
+                        item.retries += 1
+                        item.ts_last_ms = now_ms
+                        print(f"[client] Retransmit seq={seq} (try {item.retries})")
+                await asyncio.sleep(0.01)
+        except asyncio.CancelledError:
+            pass
+
+
     
     async def run(self):
         # Initial reliable hello for connection setup
