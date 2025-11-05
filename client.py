@@ -213,8 +213,6 @@ class GameClientProtocol:
         except asyncio.CancelledError:
             pass
 
-
-    
     async def run(self):
         # Initial reliable hello for connection setup
         if self.ctrl_stream_id is None:

@@ -177,9 +177,37 @@ class GameServer(QuicConnectionProtocol):
                         m_r["owl"].add(owl_ms)
                         m_r["jitter"].add(owl_ms)
 
+
+                        """
+                        ### -- TESTING RETRANSMISSION SCHEDULER --
+                        ### DROPPING + DELAYING ACKS
+                        DROP_EVERY = 7
+                        DELAY_MS = 400
+                        DELAY_MOD = 3
+
+                        seqn = self.next_expected_seq
+                        if DROP_EVERY and (seqn % DROP_EVERY == 0):
+                            print(f"[server][TEST] dropping ACK for Seq={seqn}")
+                        else:
+                            if DELAY_MS and DELAY_MOD and (seqn % DELAY_MOD == 0):
+                                print(f"[server][TEST] delaying ACK {DELAY_MS}ms for Seq={seqn}")
+                                await asyncio.sleep(DELAY_MS / 1000.0)
+
+                            self._quic.send_stream_data(
+                                self._quic.get_next_available_stream_id(is_unidirectional=False),
+                                b"ack:" + data_bytes,
+                                end_stream=False
+                            )
+                            self.transmit()
+                        #END OF RETRANSMISSION TEST
+                        """
+
+                        ##COMMENT OUT THE REST OF THE BLOCK WHEN TESTING RETRANSMISSION
+
                         # Echo ACK for RTT calculation on client side
                         self._quic.send_stream_data(self._quic.get_next_available_stream_id(is_unidirectional=False), b"ack:" + data_bytes, end_stream=False)
                         self.transmit()
+
 
                     except Exception as e:
                         print(f"[server] Error processing reliable packet: {e}")
