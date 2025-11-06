@@ -141,16 +141,34 @@ class GameClientProtocol:
         return s
     
     # --- Client Methods (API) ---
+    # gameNetAPI : Unified Send Method
+    def send(self, data=None, reliable=True, msg_type=1):
+        if reliable:
+            return self.send_reliable_state(data=data)
+        else:
+            return self.send_unreliable_movement(data=data, msg_type=msg_type)
 
-    def send_reliable_state(self):
-        """Send a reliable, sequenced game state update."""
+    def send_reliable_state(self, data=None):
+        """Send a reliable, sequenced game state update.
+        
+        Args:
+            data: Optional dict payload. If None, uses default game state.
+        """
         if self.ctrl_stream_id is None:
             self.ctrl_stream_id = self.quic.get_next_available_stream_id(is_unidirectional=False)
             
         seq = self.alloc_seq(RELIABLE_CHANNEL)
+  
+        # Use provided data or generate default
+        if data is None:
+            payload = {"player_id": 1, "score": random.randint(0, 100)}
+        else:
+            payload = data
+        
+
         critical_state = make_reliable_data(
             seq=seq,
-            payload={"player_id": 1, "score": random.randint(0, 100)}
+            payload=payload
         )
 
         self.metrics["reliable"]["tx"] += 1
@@ -168,6 +186,7 @@ class GameClientProtocol:
         self.quic.send_stream_data(self.ctrl_stream_id, critical_state, end_stream=False)
         self.endpoint.transmit()
         print(f"[client] [Reliable] SENT: Seq={seq}, Size={len(critical_state)}, TS={time.time():.4f}")
+        return seq
 
 
     def send_unreliable_movement(self):
@@ -185,6 +204,7 @@ class GameClientProtocol:
         self.quic.send_datagram_frame(datagram)
         self.endpoint.transmit()
         print(f"[client] [Unreliable] SENT: Seq={seq}, Size={len(datagram)}")
+        return seq
 
     #scans un-acked packets and resends any whose timer expired
     async def retransmit_scheduler(self):
@@ -247,7 +267,7 @@ class GameClientProtocol:
 
     async def _mixed_loop(self, reliable_hz: int = 5, unreliable_hz: int = 30):
         """
-        Sends data randomly across both channels.(not a fixed rate)
+        Sends data randomly across both channels using the unified gameNetAPI.
         """
         reliable_period = 1.0 / reliable_hz
         unreliable_period = 1.0 / unreliable_hz
@@ -263,12 +283,14 @@ class GameClientProtocol:
                 if now - last_reliable_send >= reliable_period:
                     # Randomly decide to send reliable (e.g., 50% chance when available)
                     if random.random() < 0.5:
-                        self.send_reliable_state()
+                        # Use unified API with reliable=True
+                        self.send(reliable=True)
                         last_reliable_send = now
                 
                 # Check for unreliable send opportunity (higher rate)
                 if now - last_unreliable_send >= unreliable_period:
-                    self.send_unreliable_movement()
+                    # Use unified API with reliable=False
+                    self.send(reliable=False)
                     last_unreliable_send = now
                     
                 await asyncio.sleep(min(reliable_period, unreliable_period) / 2)
