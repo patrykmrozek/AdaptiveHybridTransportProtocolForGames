@@ -250,7 +250,7 @@ class GameClientProtocol:
                         await self.emulator.transmit(self.endpoint.transmit, packet_info={"seq": item.seq, "type": "reliable"})
                         item.retries += 1
                         item.ts_last_ms = now_ms
-                        print(f"[client] Retransmit seq={seq} (try {item.retries})")
+                        print(f"[client] RETRANSMIT seq={seq} (try {item.retries})")
                 await asyncio.sleep(0.01)
         except asyncio.CancelledError:
             pass

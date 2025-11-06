@@ -64,7 +64,9 @@ class NetworkEmulator:
         if packet_info and packet_info.get("type") == "reliable":
             seq = packet_info.get("seq")
             if seq is not None and seq in self.drop_sequences:
+                #print(f"[emulator]  🎯 DROP: Seq={seq}")
                 if (self.drop_once and seq not in self._already_dropped) or (not self.drop_once):
+                    print(f"[emulator] ALREADY DROPPED: Seq={seq} ({self._already_dropped} times)")
                     self._dropped_count += 1
                     self._already_dropped.add(seq)  # future retries go through
                     return
