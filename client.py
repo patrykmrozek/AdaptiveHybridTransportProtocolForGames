@@ -386,19 +386,26 @@ class ClientEvents(QuicConnectionProtocol):
                     sent_ts = float(original_packet.get("ts", rx_ts))
 
                     client = getattr(self, "metrics_client", None)
-                    if client is not None and seq is not None:
-                        item = client._inflight.pop(seq, None)
-                        if item is not None:
-                            rtt_ms = (rx_ts * 1000.0) - item.ts_last_ms
-                        else:
-                            rtt_ms = (rx_ts - sent_ts) * 1000.0
-                        m = client.metrics["reliable"]
-                        m["ack"] += 1
-                        m["rtt"].add(rtt_ms)
-                        m["jitter"].add(rtt_ms)
-                        client._update_rtt(rtt_ms)
-                    else:
-                        rtt_ms = (rx_ts - sent_ts) * 1000.0
+                    if client is None and seq is None:
+                        return
+                    if not hasattr(client, "_acked_seqs"):
+                        client._acked_seqs = set()
+                    if seq in client._acked_seqs:
+                        return
+                    item = client._inflight.pop(seq, None)
+                    if item is None:
+                        client._acked_seqs.add(seq)
+                        return
+
+                    rtt_ms = (rx_ts - sent_ts) * 1000.0
+                    client._acked_seqs.add(seq)
+
+                    m = client.metrics["reliable"]
+                    m["ack"] += 1
+                    m["rtt"].add(rtt_ms)
+                    m["jitter"].add(rtt_ms)
+                    client._update_rtt(rtt_ms)
+
                     print(f"[client] [Reliable] ACK RX: AppSeq={seq}, RTT={rtt_ms:.2f}ms")
                     return
 

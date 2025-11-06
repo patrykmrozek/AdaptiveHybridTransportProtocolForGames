@@ -213,7 +213,6 @@ class GameServer(QuicConnectionProtocol):
                         m_r["jitter"].add(owl_ms)
 
 
-                        """
                         ### -- TESTING RETRANSMISSION SCHEDULER --
                         ### DROPPING + DELAYING ACKS
                         DROP_EVERY = 7
@@ -235,7 +234,6 @@ class GameServer(QuicConnectionProtocol):
                             )
                             await self.emulator.transmit(self.transmit)
                         #END OF RETRANSMISSION TEST
-                        """
 
                         ##COMMENT OUT THE REST OF THE BLOCK WHEN TESTING RETRANSMISSION
 
