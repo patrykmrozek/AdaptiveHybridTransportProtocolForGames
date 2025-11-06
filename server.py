@@ -44,7 +44,6 @@ class GameServer(QuicConnectionProtocol):
         self.reliable_buffer: Dict[int, Tuple[float, bytes]] = {}
         self.next_expected_seq = 0
         # Track when we started waiting for each missing sequence {seq: wait_start_ts}
-        self.missing_seq_wait_start: Dict[int, float] = {}
         self.flush_task: Optional[asyncio.Task] = None
         self._last_counters = {"rel_rx": 0, "unrel_rx": 0, "bytes": 0}
 
@@ -153,7 +152,6 @@ class GameServer(QuicConnectionProtocol):
                             "rel_rx": self.metrics["reliable"]["rx"],
                         }
                         sid = self._quic.get_next_available_stream_id(is_unidirectional=False)
-                        self._quic.send_stream_data(sid, json.dumps(stats).encode(), end_stream=False)
                         self._quic.send_stream_data(sid, json.dumps(stats).encode(), end_stream=False)
                         await self.emulator.transmit(self.transmit)
                     except Exception as e:
