@@ -4,7 +4,7 @@ import random
 import time
 from typing import Optional, Dict
 from metrics import RollingStats, Jitter
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 try:
     import uvloop
@@ -20,6 +20,12 @@ from aioquic.quic.events import (
     StreamDataReceived,
     HandshakeCompleted,
 )
+
+def get_timestamp():
+    """Return formatted timestamp for logging: HH:MM:SS.mmm"""
+    now = time.time()
+    ms = int((now * 1000) % 1000)
+    return time.strftime("%H:%M:%S", time.localtime(now)) + f".{ms:03d}"
 from network_emulator import NetworkEmulator
 
 @dataclass
@@ -35,6 +41,7 @@ ALPN = "game/1"
 RELIABLE_CHANNEL = 0  # Used for Stream Data (Critical State)
 UNRELIABLE_CHANNEL = 1  # Used for Datagrams (Movement)
 
+# Part A : Packet Header
 def make_dgram(msg_type: int, channel: int, seq: int, payload: bytes) -> bytes:
     # Header: MsgType(1B), Channel(1B), Seq(2B) + Payload
     return bytes([msg_type & 0xFF, channel & 0xFF]) + seq.to_bytes(2, "big") + payload
@@ -59,8 +66,8 @@ class GameClientProtocol:
         self.quic: QuicConnection = endpoint._quic
         self.seq_by_channel = {RELIABLE_CHANNEL: -1, UNRELIABLE_CHANNEL: -1}
         self.ctrl_stream_id: Optional[int] = None
-        
-        # Initialize emulator (if not provided, create disabled one)
+
+        # Network emulator (defaults to disabled if not provided)
         self.emulator = emulator if emulator is not None else NetworkEmulator(enabled=False)
 
         self._start_time = time.time()
@@ -78,9 +85,13 @@ class GameClientProtocol:
         #storage for server rx counters
         self._server_unrel_rx = 0
 
+        # Retransmission settings
+        self._retransmit_timeout_ms = 100  # Initial timeout (will be updated based on RTT)
+        self._max_rtt_estimate_ms = 200  # Maximum RTT estimate for timeout calculation
+
         self.metrics = {
             "reliable": {
-                "tx": 0, "ack": 0, "bytes_tx": 0,
+                "tx": 0, "ack": 0, "bytes_tx": 0, "retransmit": 0,
                 "rtt": RollingStats(), "jitter": Jitter()
             },
             "unreliable": {
@@ -119,7 +130,7 @@ class GameClientProtocol:
         r_tput = r["bytes_tx"] / 1024.0 / dur
         pdr = 100.0 * r["ack"] / max(1, r["tx"])
         print("\n[client] 📊 ---- METRIC SUMMARY ----")
-        print(f"[metrics][RELIABLE] TX={r['tx']} ACK={r['ack']} PDR={pdr:.1f}% BytesTX={r['bytes_tx']}")
+        print(f"[metrics][RELIABLE] TX={r['tx']} ACK={r['ack']} RETX={r.get('retransmit', 0)} PDR={pdr:.1f}% BytesTX={r['bytes_tx']}")
         if len(r["rtt"].samples) > 0:
             print(f"    RTT(ms): avg={r['rtt'].avg():.2f} "
                   f"p50={r_p.get(50, float('nan')):.2f} "
@@ -162,7 +173,7 @@ class GameClientProtocol:
             self.ctrl_stream_id = self.quic.get_next_available_stream_id(is_unidirectional=False)
             
         seq = self.alloc_seq(RELIABLE_CHANNEL)
-  
+
         # Use provided data or generate default
         if data is None:
             payload = {"player_id": 1, "score": random.randint(0, 100)}
@@ -203,7 +214,7 @@ class GameClientProtocol:
         x = random.uniform(-10, 10)
         y = random.uniform(-10, 10)
         # Include timestamp in payload for One-Way Latency (OWL) calculation
-        payload = f"pos:{x:.2f},{y:.2f},ts:{time.time():.4f}".encode() 
+        payload = f"pos:{x:.2f},{y:.2f},ts:{time.time():.4f}".encode()
         seq = self.alloc_seq(UNRELIABLE_CHANNEL)
         datagram = make_dgram(msg_type=msg_type, channel=UNRELIABLE_CHANNEL, seq=seq, payload=payload)
 
@@ -232,7 +243,10 @@ class GameClientProtocol:
                             del self._inflight[seq]
                             print(f"[client] Drop seq={seq} after {item.retries} retries")
                             continue
+
                         #resend same exact data on same stream - retransmit
+                        self.metrics["reliable"]["retransmit"] += 1
+                        self.metrics["reliable"]["bytes_tx"] += len(item.payload_bytes)
                         self.quic.send_stream_data(item.ctrl_stream_id, item.payload_bytes, end_stream=False)
                         await self.emulator.transmit(self.endpoint.transmit, packet_info={"seq": item.seq, "type": "reliable"})
                         item.retries += 1
@@ -262,7 +276,7 @@ class GameClientProtocol:
             self._metrics_task.cancel()
         if self._retransmit_task:
             self._retransmit_task.cancel()
-        
+
         self.quic.close()
         await self.emulator.transmit(self.endpoint.transmit)
 
@@ -273,6 +287,49 @@ class GameClientProtocol:
                 await asyncio.sleep(0.05)
         except asyncio.CancelledError:
             pass
+
+    """
+    async def _retransmit_loop(self):
+        #Periodically checks for unACKed packets and retransmits them.
+        try:
+            while True:
+                await asyncio.sleep(0.05)  # Check every 50ms
+                now = time.time()
+
+                # Calculate timeout based on current RTT estimate
+                rtt_samples = self.metrics["reliable"]["rtt"].samples
+                if len(rtt_samples) > 0:
+                    avg_rtt = sum(rtt_samples) / len(rtt_samples)
+                    timeout_ms = max(100, avg_rtt * 2)  # 2x RTT, minimum 100ms
+                else:
+                    timeout_ms = self._retransmit_timeout_ms
+
+                # Check each unACKed packet
+                to_retransmit = []
+                for seq, pkt_info in list(self._inflight.items()):
+                    elapsed_ms = (now - pkt_info["last_retry_ts"]) * 1000
+
+                    if elapsed_ms >= timeout_ms:
+                        to_retransmit.append((seq, pkt_info))
+
+                # Retransmit packets that timed out
+                for seq, pkt_info in to_retransmit:
+                    pkt_info["retry_count"] += 1
+                    pkt_info["last_retry_ts"] = now
+
+                    self.metrics["reliable"]["retransmit"] += 1
+                    self.metrics["reliable"]["bytes_tx"] += len(pkt_info["packet_data"])
+
+                    self.quic.send_stream_data(self.ctrl_stream_id, pkt_info["packet_data"], end_stream=False)
+                    await self.emulator.transmit(
+                        self.endpoint.transmit,
+                        packet_info={"seq": seq, "type": "reliable"}
+                    )
+                    print(f"[{get_timestamp()}] [client] [Reliable] RETRANSMIT: Seq={seq}, Retry={pkt_info['retry_count']}, Timeout={timeout_ms:.1f}ms")
+
+        except asyncio.CancelledError:
+            pass
+    """
 
     async def _mixed_loop(self, reliable_hz: int = 5, unreliable_hz: int = 30):
         """
@@ -347,6 +404,20 @@ class ClientEvents(QuicConnectionProtocol):
                     return
 
                 pkt = json.loads(data_str)
+                if pkt.get("type") == "skip":
+                    # Server explicitly notified us that a packet was skipped
+                    skipped_seq = pkt.get("seq")
+                    next_seq = pkt.get("next_seq")
+                    client = getattr(self, "metrics_client", None)
+                    if client is not None:
+                        # Remove the explicitly skipped packet only
+                        # Don't infer other packets as skipped - they should be ACKed normally if they arrive
+                        skipped_info = client._inflight.pop(skipped_seq, None)
+                        if skipped_info:
+                            print(f"[{get_timestamp()}] [client] ⚠️ EXPLICIT SKIP: Seq={skipped_seq} skipped by server "
+                                  f"(next_seq={next_seq}). Retries={skipped_info.retries}")
+                    return
+
                 if pkt.get("type") == "server_metrics":
                     client = getattr(self, "metrics_client", None)
                     if client:
@@ -355,16 +426,31 @@ class ClientEvents(QuicConnectionProtocol):
                         client._print_metrics_summary()
                     return
 
-            except Exception:
                 # Handle initial client_hello ACK or malformed data
                 if data_str and "client_hello" not in data_str:
-                    print(f"[client] [Reliable] Data RX: {event.data!r}")
+                    print(f"[{get_timestamp()}] [client] [Reliable] Data RX (non-JSON): {data_str[:100]!r}")
+            except Exception as e:
+                # Handle other exceptions
+                if data_str and "client_hello" not in data_str:
+                    print(f"[client] [Reliable] Data RX (exception): {event.data!r}, error: {e}")
 
 
 async def main(host: str = "127.0.0.1", port: int = 4433,
                emulation_enabled: bool = False, delay_ms: float = 0,
                jitter_ms: float = 0, packet_loss_rate: float = 0.0,
                drop_sequences: set = None):
+    """
+    Main client function.
+
+    Args:
+        host: Server hostname
+        port: Server port
+        emulation_enabled: Enable network emulation
+        delay_ms: Base delay in milliseconds
+        jitter_ms: Jitter variation in milliseconds
+        packet_loss_rate: Packet loss rate (0.0 to 1.0)
+        drop_sequences: Set of sequence numbers to selectively drop (for testing retransmission)
+    """
     cfg = QuicConfiguration(
         is_client=True,
         alpn_protocols=[ALPN],
@@ -386,7 +472,7 @@ async def main(host: str = "127.0.0.1", port: int = 4433,
         client = GameClientProtocol(endpoint, emulator=emulator)
         endpoint.metrics_client = client
         await client.run()
-        
+
         # Print emulator stats if enabled
         if emulation_enabled:
             stats = emulator.get_stats()
@@ -397,10 +483,10 @@ async def main(host: str = "127.0.0.1", port: int = 4433,
 
 if __name__ == "__main__":
     # Example configurations (uncomment one):
-    
+
     # 1. No emulation (normal operation)
     # asyncio.run(main())
-    
+
     # 2. Test retransmission with selective drops
     # asyncio.run(main(
     #     emulation_enabled=True,
@@ -409,7 +495,7 @@ if __name__ == "__main__":
     #     packet_loss_rate=0.0,
     #     drop_sequences={3, 7, 12}  # Drop specific packets to test retransmission
     # ))
-    
+
     # 3. Test reordering with jitter (no drops)
     asyncio.run(main(
         emulation_enabled=True,
@@ -419,7 +505,7 @@ if __name__ == "__main__":
         drop_sequences={3, 7, 12}   # Drop these specific packets to test retransmission
     ))
 
-    
+
     # 4. Test combined: retransmission + reordering
     # asyncio.run(main(
     #     emulation_enabled=True,

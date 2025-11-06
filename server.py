@@ -1,7 +1,7 @@
 import asyncio
 import json
 import time
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Tuple, Optional
 from metrics import RollingStats, Jitter
 
 METRIC_SUMMARY_EVERY_S = 5.0 #how many seconds between esach metric summary
@@ -21,6 +21,12 @@ from aioquic.quic.events import (
 )
 from network_emulator import NetworkEmulator
 
+def get_timestamp():
+    """Return formatted timestamp for logging: HH:MM:SS.mmm"""
+    now = time.time()
+    ms = int((now * 1000) % 1000)
+    return time.strftime("%H:%M:%S", time.localtime(now)) + f".{ms:03d}"
+
 ALPN = "game/1"
 RELIABLE_TIMEOUT_MS = 200  # T milliseconds threshold
 
@@ -37,15 +43,17 @@ class GameServer(QuicConnectionProtocol):
         # Application-layer buffer for reliable packets {app_seq: (timestamp_rx, data_bytes)}
         self.reliable_buffer: Dict[int, Tuple[float, bytes]] = {}
         self.next_expected_seq = 0
+        # Track when we started waiting for each missing sequence {seq: wait_start_ts}
+        self.missing_seq_wait_start: Dict[int, float] = {}
         self.flush_task: Optional[asyncio.Task] = None
         self._last_counters = {"rel_rx": 0, "unrel_rx": 0, "bytes": 0}
 
+        # Network emulator (defaults to disabled if not provided)
+        self.emulator = emulator if emulator is not None else NetworkEmulator(enabled=False)
+
         self._start_time = time.time()
         self.metrics_task: Optional[asyncio.Task] = None
-        
-        # Initialize emulator (if not provided, create disabled one)
-        self.emulator = emulator if emulator is not None else NetworkEmulator(enabled=False)
-        
+
         #set up metric storage
         self.metrics = {
             "reliable": {
@@ -71,9 +79,9 @@ class GameServer(QuicConnectionProtocol):
         except RuntimeError:
             # No running loop, just call transmit directly (fallback)
             self.transmit()
-    
+
     def _had_activity_since_last(self):
-        r = self.metrics["reliable"];
+        r = self.metrics["reliable"]
         u = self.metrics["unreliable"]
         cur = {
             "rel_rx": r.get("rx", 0),
@@ -146,6 +154,7 @@ class GameServer(QuicConnectionProtocol):
                         }
                         sid = self._quic.get_next_available_stream_id(is_unidirectional=False)
                         self._quic.send_stream_data(sid, json.dumps(stats).encode(), end_stream=False)
+                        self._quic.send_stream_data(sid, json.dumps(stats).encode(), end_stream=False)
                         await self.emulator.transmit(self.transmit)
                     except Exception as e:
                         print(f"[server] Warning: failed to send metrics heartbeat: {e}")
@@ -158,8 +167,7 @@ class GameServer(QuicConnectionProtocol):
             while True:
                 await asyncio.sleep(0.01)  # Check frequently
                 now = time.time()
-                skipped_this_cycle = False
-                
+
                 if self.next_expected_seq not in self.reliable_buffer:
                     next_available_seq = self.next_expected_seq + 1
                     
@@ -170,8 +178,20 @@ class GameServer(QuicConnectionProtocol):
                          if time_waiting > RELIABLE_TIMEOUT_MS:
                             self.metrics["reliable"]["stale"] += 1
                             print(f"[server] ⚠️ RELIABLE SKIP: Seq={self.next_expected_seq} skipped. Next Seq={next_available_seq} waited for {time_waiting:.2f}ms > {RELIABLE_TIMEOUT_MS}ms.")
+
+                            try:
+                                skip_msg = json.dumps({
+                                    "type": "skip",
+                                    "seq": self.next_expected_seq,
+                                    "next_seq": next_available_seq
+                                }).encode()
+                                sid = self._quic.get_next_available_stream_id(is_unidirectional=False)
+                                self._quic.send_stream_data(sid, skip_msg, end_stream=False)
+                                await self.emulator.transmit(self.transmit)
+                            except Exception as e:
+                                print(f"[server] Warn: failed to send skip notice: {e}")
+
                             self.next_expected_seq += 1
-                            skipped_this_cycle = True
                             continue
 
                 
@@ -318,7 +338,7 @@ async def main(host="0.0.0.0", port=4433,
                jitter_ms: float = 0, packet_loss_rate: float = 0.0,
                drop_sequences: set = None):
     cfg = make_server_cfg()
-    
+
     # Create network emulator
     emulator = NetworkEmulator(
         enabled=emulation_enabled,
@@ -327,11 +347,11 @@ async def main(host="0.0.0.0", port=4433,
         packet_loss_rate=packet_loss_rate,
         drop_sequences=drop_sequences or set()
     )
-    
+
     # Create protocol factory that passes emulator to each connection
     def create_protocol(*args, **kwargs):
         return GameServer(*args, emulator=emulator, **kwargs)
-    
+
     await serve(host, port, configuration=cfg, create_protocol=create_protocol)
     print(f"[server] QUIC listening on {host}:{port} (ALPN={ALPN})")
     print(f"[server] Reliable data skip threshold (T): {RELIABLE_TIMEOUT_MS} ms.")
@@ -342,10 +362,10 @@ async def main(host="0.0.0.0", port=4433,
 
 if __name__ == "__main__":
     # Example configurations (uncomment one):
-    
+
     # 1. No emulation (normal operation)
     asyncio.run(main())
-    
+
     # 2. Server-side emulation (affects ACKs back to client)
     # asyncio.run(main(
     #     emulation_enabled=True,
