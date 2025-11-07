@@ -379,36 +379,43 @@ class ClientEvents(QuicConnectionProtocol):
             data_str = None
             try:
                 data_str = event.data.decode()
-                if data_str.startswith("ack:"):
+                ack_seq = None
+                if data_str.startswith("{ack:"):
+                    try:
+                        ack_seq = json.loads(data_str)["ack"]
+                    except Exception as e:
+                        pass
+                elif data_str.startswith("ack:"):
+                    try:
+                        original_packet = json.loads(data_str[4:])
+                        ack_seq = original_packet.get("seq")
+                    except Exception as e:
+                        pass
+                if ack_seq is not None:
                     # Parse the echoed reliable packet to get the original timestamp
-                    original_packet = json.loads(data_str[4:])
-                    seq = original_packet.get("seq")
-
-                    # Calculate RTT based on sender's original timestamp
-                    sent_ts = float(original_packet.get("ts", rx_ts))
-
                     client = getattr(self, "metrics_client", None)
-                    if client is None and seq is None:
+                    if client is None and ack_seq is None:
                         return
                     if not hasattr(client, "_acked_seqs"):
                         client._acked_seqs = set()
-                    if seq in client._acked_seqs:
+                    if ack_seq in client._acked_seqs:
                         return
-                    item = client._inflight.pop(seq, None)
+                    item = client._inflight.pop(ack_seq, None)
+                    client._acked_seqs.add(ack_seq)
+
                     if item is None:
-                        client._acked_seqs.add(seq)
                         return
 
+                    # Calculate RTT based on sender's original timestamp
+                    sent_ts = json.loads(item.payload_bytes.decode()).get("ts", rx_ts)
                     rtt_ms = (rx_ts - sent_ts) * 1000.0
-                    client._acked_seqs.add(seq)
 
                     m = client.metrics["reliable"]
                     m["ack"] += 1
                     m["rtt"].add(rtt_ms)
                     m["jitter"].add(rtt_ms)
                     client._update_rtt(rtt_ms)
-
-                    print(f"[client] [Reliable] ACK RX: AppSeq={seq}, RTT={rtt_ms:.2f}ms")
+                    print(f"[client] [Reliable] ACK RX: AppSeq={ack_seq}, RTT={rtt_ms:.2f}ms")
                     return
 
                 pkt = json.loads(data_str)
