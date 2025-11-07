@@ -141,7 +141,7 @@ class GameClientProtocol:
                 f"    RTT(ms): avg={r['rtt'].avg():.2f} p50={r_p.get(50, float('nan')):.2f} p95={r_p.get(95, float('nan')):.2f} jitter(RFC3550)={r['jitter'].value():.2f}")
         else:
             print("    RTT(ms): No samples yet")
-        print(f"    Throughput ≈ {r_tput} kB/s")
+        print(f"    Throughput ≈ {r_tput:.2f} kB/s")
 
         u = self.metrics["unreliable"]
         u_tput = u["bytes_tx"] / 1024.0 / dur
@@ -224,10 +224,19 @@ class GameClientProtocol:
 
         self.metrics["unreliable"]["tx"] += 1
         self._client_unrel_tx_total = self.metrics["unreliable"]["tx"]
-        self.metrics["unreliable"]["bytes_tx"] += len(datagram)
 
+        #decide loss before enqueuing
+        if self.emulator.should_drop_unreliable_frame():
+            await self.emulator.transmit(self.endpoint.transmit)
+            print(f"[client] [Unreliable] DROP(decided): Seq={seq}, Size={len(datagram)}")
+            return seq
+
+        self.metrics["unreliable"]["bytes_tx"] += len(datagram)
         self.quic.send_datagram_frame(datagram)
-        await self.emulator.transmit(self.endpoint.transmit)
+        await self.emulator.transmit(
+            self.endpoint.transmit,
+            packet_info={"seq": seq, "type": "unreliable"}
+        )
         print(f"[client] [Unreliable] SENT: Seq={seq}, Size={len(datagram)}")
         return seq
 
@@ -404,6 +413,7 @@ class ClientEvents(QuicConnectionProtocol):
                             client._server_unrel_rx_total = 0
                             client._client_unrel_tx_total = 0
                             client._last_pdr_interval = float("nan")
+                            client._last_pdr_total = float("nan")
                         continue
 
                     ack_seq = None
@@ -449,29 +459,29 @@ class ClientEvents(QuicConnectionProtocol):
 
                     if obj and obj.get("type") == "server_metrics":
                         client = getattr(self, "metrics_client", None)
-                        if client:
-                            server_unrel_rx_now = int(obj.get("unrel_rx", 0))
-                            client_unrel_tx_now = client.metrics["unreliable"]["tx"]
-                            d_rx = server_unrel_rx_now - client._server_unrel_rx_prev
-                            d_tx = client_unrel_tx_now - client._client_unrel_tx_prev
-                            pdr_interval = 100.0 if d_tx <= 0 else max(0.0, min(100.0, 100.0 * d_rx / d_tx))
-                            client._server_unrel_rx_prev = server_unrel_rx_now
-                            client._client_unrel_tx_prev = client_unrel_tx_now
-                            client._last_pdr_interval = pdr_interval
-                            client._server_unrel_rx_total = server_unrel_rx_now
-                            client._client_unrel_tx_total = client_unrel_tx_now
-                            pdr_total = 100.0 * server_unrel_rx_now / max(1, client_unrel_tx_now)
+                        if not client:
+                            return
 
-                            d_rx = server_unrel_rx_now - client._server_unrel_rx_prev
-                            d_tx = client_unrel_tx_now - client._client_unrel_tx_prev
-                            pdr_interval = 100.0 if d_tx <= 0 else max(0.0, min(100.0, 100.0 * d_rx / d_tx))
+                        server_unrel_rx_now = int(obj.get("unrel_rx", 0))
+                        client_unrel_tx_now = client.metrics["unreliable"]["tx"]
 
-                            client._server_unrel_rx_prev = server_unrel_rx_now
-                            client._client_unrel_tx_prev = client_unrel_tx_now
+                        #interval deltas
+                        d_rx = server_unrel_rx_now - client._server_unrel_rx_prev
+                        d_tx = client_unrel_tx_now - client._client_unrel_tx_prev
+                        pdr_interval = 100.0 if d_tx <= 0 else max(0.0, min(100.0, 100.0 * d_rx / d_tx))
 
-                            client._print_metrics_summary(pdr_total, pdr_interval)
+                        #totals
+                        pdr_total = 100.0 * server_unrel_rx_now / max(1, client_unrel_tx_now)
 
-                        continue
+                        client._server_unrel_rx_prev = server_unrel_rx_now
+                        client._client_unrel_tx_prev = client_unrel_tx_now
+                        client._server_unrel_rx_total = server_unrel_rx_now
+                        client._client_unrel_tx_total = client_unrel_tx_now
+                        client._last_pdr_interval = pdr_interval
+                        client._last_pdr_total = pdr_total
+
+                        client._print_metrics_summary(pdr_total, pdr_interval)
+                        return
 
                     if "client_hello" not in data_str:
                         print(f"[{get_timestamp()}] [client] [Reliable] Data RX (non-JSON): {data_str[:100]!r}")
@@ -598,8 +608,8 @@ asyncio.run(main(
         jitter_ms=5,
         drop_sequences=set(),
     ))
-
 """
+
 # 4 b)) high loss - TEST_DISTURB_ACKS = False
 asyncio.run(main(
     emulation_enabled=True,
