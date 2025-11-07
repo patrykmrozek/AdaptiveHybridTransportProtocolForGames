@@ -66,7 +66,7 @@ class NetworkEmulator:
             if seq is not None and seq in self.drop_sequences:
                 #print(f"[emulator]  🎯 DROP: Seq={seq}")
                 if (self.drop_once and seq not in self._already_dropped) or (not self.drop_once):
-                    print(f"[emulator] ALREADY DROPPED: Seq={seq} ({self._already_dropped} times)")
+                    #print(f"[emulator] ALREADY DROPPED: Seq={seq} ({len(self._already_dropped)} times)")
                     self._dropped_count += 1
                     self._already_dropped.add(seq)  # future retries go through
                     return
@@ -103,6 +103,19 @@ class NetworkEmulator:
             "packet_loss_rate": self.packet_loss_rate,
             "drop_sequences": self.drop_sequences
         }
+
+    def should_drop_unreliable_frame(self) -> bool:
+        if not self.enabled or self.packet_loss_rate <= 0:
+            self._total_count += 1
+            return False
+        import random
+        drop = random.random() < self.packet_loss_rate
+        self._total_count += 1
+        if drop:
+            self._dropped_count += 1
+            print(f"[emulator] 📦 Unreliable FRAME DROPPED (p={self.packet_loss_rate:.2%}, "
+                  f"dropped={self._dropped_count}/{self._total_count})")
+        return drop
     
     def reset_stats(self):
         """Reset emulation statistics."""
