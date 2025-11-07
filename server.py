@@ -5,6 +5,7 @@ from typing import Dict, Tuple, Optional
 from metrics import RollingStats, Jitter
 
 METRIC_SUMMARY_EVERY_S = 5.0 #how many seconds between esach metric summary
+TEST_DISTURB_ACKS = False
 
 try:
     import uvloop
@@ -168,7 +169,7 @@ class GameServer(QuicConnectionProtocol):
 
                 if self.next_expected_seq not in self.reliable_buffer:
                     next_available_seq = self.next_expected_seq + 1
-                    
+
                     if next_available_seq in self.reliable_buffer:
                          (rx_ts, _) = self.reliable_buffer[next_available_seq]
                          time_waiting = (now - rx_ts) * 1000
@@ -192,19 +193,14 @@ class GameServer(QuicConnectionProtocol):
                             self.next_expected_seq += 1
                             continue
 
-                
                 while self.next_expected_seq in self.reliable_buffer:
                     rx_ts, data_bytes = self.reliable_buffer.pop(self.next_expected_seq)
                     try:
-                        
                         packet = json.loads(data_bytes.decode())
-                        
-                        # one-way latency OWL
                         sent_ts = packet.get("ts", now)
                         owl_ms = (rx_ts - sent_ts) * 1000
-                        
-                        # Logging
-                        print(f"[server] ✅ RELIABLE RX: Seq={self.next_expected_seq}, OWL={owl_ms:.2f}ms, Data={packet.get('data')}")
+                        print(
+                            f"[server] ✅ RELIABLE RX: Seq={self.next_expected_seq}, OWL={owl_ms:.2f}ms, Data={packet.get('data')}")
 
                         m_r = self.metrics["reliable"]
                         m_r["rx"] += 1
@@ -212,40 +208,36 @@ class GameServer(QuicConnectionProtocol):
                         m_r["owl"].add(owl_ms)
                         m_r["jitter"].add(owl_ms)
 
-
-                        ### -- TESTING RETRANSMISSION SCHEDULER --
-                        ### DROPPING + DELAYING ACKS
-                        DROP_EVERY = 7
-                        DELAY_MS = 400
-                        DELAY_MOD = 3
-
-                        seqn = self.next_expected_seq
-                        if DROP_EVERY and (seqn % DROP_EVERY == 0):
-                            print(f"[server][TEST] dropping ACK for Seq={seqn}")
+                        # send exactly one ACK in baseline
+                        if TEST_DISTURB_ACKS:
+                            DROP_EVERY = 7
+                            DELAY_MS = 400
+                            DELAY_MOD = 3
+                            seqn = self.next_expected_seq
+                            if DROP_EVERY and (seqn % DROP_EVERY == 0):
+                                print(f"[server][TEST] dropping ACK for Seq={seqn}")
+                            else:
+                                if DELAY_MS and DELAY_MOD and (seqn % DELAY_MOD == 0):
+                                    print(f"[server][TEST] delaying ACK {DELAY_MS}ms for Seq={seqn}")
+                                    await asyncio.sleep(DELAY_MS / 1000.0)
+                                self._quic.send_stream_data(
+                                    self._quic.get_next_available_stream_id(is_unidirectional=False),
+                                    b"ack:" + data_bytes,
+                                    end_stream=False
+                                )
+                                await self.emulator.transmit(self.transmit)
                         else:
-                            if DELAY_MS and DELAY_MOD and (seqn % DELAY_MOD == 0):
-                                print(f"[server][TEST] delaying ACK {DELAY_MS}ms for Seq={seqn}")
-                                await asyncio.sleep(DELAY_MS / 1000.0)
-
                             self._quic.send_stream_data(
                                 self._quic.get_next_available_stream_id(is_unidirectional=False),
                                 b"ack:" + data_bytes,
                                 end_stream=False
                             )
                             await self.emulator.transmit(self.transmit)
-                        #END OF RETRANSMISSION TEST
 
-                        ##COMMENT OUT THE REST OF THE BLOCK WHEN TESTING RETRANSMISSION
-
-                        # Echo ACK for RTT calculation on client side
-                        self._quic.send_stream_data(self._quic.get_next_available_stream_id(is_unidirectional=False), b"ack:" + data_bytes, end_stream=False)
-                        await self.emulator.transmit(self.transmit)
-
+                        self.next_expected_seq += 1
 
                     except Exception as e:
-                        print(f"[server] Error processing reliable packet: {e}")
-                    
-                    self.next_expected_seq += 1
+                        print(f"[server] Reliable RX error: {e}")
 
         except asyncio.CancelledError:
             pass
