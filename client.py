@@ -85,6 +85,8 @@ class GameClientProtocol:
 
         #storage for server rx counters
         self._server_unrel_rx = 0
+        self._server_unrel_rx_prev = 0
+        self._server_unrel_tx_prev = 0
 
         # Retransmission settings
         self._retransmit_timeout_ms = 100  # Initial timeout (will be updated based on RTT)
@@ -263,7 +265,16 @@ class GameClientProtocol:
             self.ctrl_stream_id = self.quic.get_next_available_stream_id(is_unidirectional=False)
             hello = json.dumps({"type": "client_hello"}).encode()
             self.quic.send_stream_data(self.ctrl_stream_id, hello, end_stream=False)
+            self.quic.send_stream_data(self.ctrl_stream_id, b'{"type":"metrics_reset"}', end_stream=False)
             await self.emulator.transmit(self.endpoint.transmit)
+            self._start_time = time.time()
+            self.metrics["reliable"]["tx"] = 0
+            self.metrics["reliable"]["ack"] = 0
+            self.metrics["reliable"]["bytes_tx"] = 0
+            self.metrics["unreliable"]["tx"] = 0
+            self.metrics["unreliable"]["bytes_tx"] = 0
+            self._server_unrel_rx_prev = 0
+            self._client_unrel_tx_prev = 0
 
         recv_task = asyncio.create_task(self._recv_loop())
         # Part f Randomized sending loop
