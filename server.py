@@ -5,7 +5,7 @@ from typing import Dict, Tuple, Optional
 from metrics import RollingStats, Jitter
 
 METRIC_SUMMARY_EVERY_S = 5.0 #how many seconds between esach metric summary
-TEST_DISTURB_ACKS = False
+TEST_DISTURB_ACKS = False #only true for test 2
 
 try:
     import uvloop
@@ -126,6 +126,15 @@ class GameServer(QuicConnectionProtocol):
             print(f"    Throughput ≈ {tput:.2f} kB/s")
         print("[server] --------------------------\n")
 
+    async def _delayed_ack(self, seq: int, delay_ms: int):
+        try:
+            await asyncio.sleep(delay_ms / 1000.0)
+            sid = self._quic.get_next_available_stream_id(is_unidirectional=False)
+            self._quic.send_stream_data(sid, json.dumps({"ack": seq}).encode(), end_stream=False)
+            await self.emulator.transmit(self.transmit)
+        except Exception as e:
+            print(f"[server] Warn: delayed ACK failed for seq {seq}: {e}")
+
     def connection_made(self, transport):
         super().connection_made(transport)
         # Part e background task to flush the reliable packet buffer RDT
@@ -197,8 +206,9 @@ class GameServer(QuicConnectionProtocol):
                     rx_ts, data_bytes = self.reliable_buffer.pop(self.next_expected_seq)
                     try:
                         packet = json.loads(data_bytes.decode())
-                        sent_ts = packet.get("ts", now)
-                        owl_ms = (rx_ts - sent_ts) * 1000
+                        sent_ts = packet.get("ts", rx_ts)
+                        owl_ms = (rx_ts - sent_ts) * 1000.0
+
                         print(
                             f"[server] ✅ RELIABLE RX: Seq={self.next_expected_seq}, OWL={owl_ms:.2f}ms, Data={packet.get('data')}")
 
@@ -208,32 +218,7 @@ class GameServer(QuicConnectionProtocol):
                         m_r["owl"].add(owl_ms)
                         m_r["jitter"].add(owl_ms)
 
-                        # send exactly one ACK in baseline
-                        if TEST_DISTURB_ACKS:
-                            DROP_EVERY = 7
-                            DELAY_MS = 400
-                            DELAY_MOD = 3
-                            seqn = self.next_expected_seq
-                            if DROP_EVERY and (seqn % DROP_EVERY == 0):
-                                print(f"[server][TEST] dropping ACK for Seq={seqn}")
-                            else:
-                                if DELAY_MS and DELAY_MOD and (seqn % DELAY_MOD == 0):
-                                    print(f"[server][TEST] delaying ACK {DELAY_MS}ms for Seq={seqn}")
-                                    await asyncio.sleep(DELAY_MS / 1000.0)
-                                self._quic.send_stream_data(
-                                    self._quic.get_next_available_stream_id(is_unidirectional=False),
-                                    b"ack:" + data_bytes,
-                                    end_stream=False
-                                )
-                                await self.emulator.transmit(self.transmit)
-                        else:
-                            self._quic.send_stream_data(
-                                self._quic.get_next_available_stream_id(is_unidirectional=False),
-                                b"ack:" + data_bytes,
-                                end_stream=False
-                            )
-                            await self.emulator.transmit(self.transmit)
-
+                        # Do NOT send ACK here. Fast-ACK is sent on receipt.
                         self.next_expected_seq += 1
 
                     except Exception as e:
@@ -294,6 +279,26 @@ class GameServer(QuicConnectionProtocol):
 
                 else:
                     print(f"[server] [Reliable] RX: Unsequenced data: {event.data!r}")
+
+                #fast ack on receipt
+                if TEST_DISTURB_ACKS:
+                    DROP_EVERY = 7
+                    DELAY_MS = 400
+                    DELAY_MOD = 3
+                    if DROP_EVERY and (app_seq % DROP_EVERY == 0):
+                        print(f"[server][TEST] dropping ACK for Seq={app_seq}")
+                    else:
+                        if DELAY_MS and DELAY_MOD and (app_seq % DELAY_MOD == 0):
+                            print(f"[server][TEST] delaying ACK {DELAY_MS}ms for Seq={app_seq}")
+                            asyncio.get_running_loop().create_task(self._delayed_ack(app_seq, DELAY_MS))
+                        else:
+                            sid = self._quic.get_next_available_stream_id(is_unidirectional=False)
+                            self._quic.send_stream_data(sid, b"ack:" + event.data, end_stream=False)
+                            self._safe_transmit()
+                else:
+                    sid = self._quic.get_next_available_stream_id(is_unidirectional=False)
+                    self._quic.send_stream_data(sid, b"ack:" + event.data, end_stream=False)
+                    self._safe_transmit()
             
             except json.JSONDecodeError:
                 print(f"[server] [Reliable] RX: Non-JSON data on stream {event.stream_id}")
@@ -358,7 +363,7 @@ if __name__ == "__main__":
     # Example configurations (uncomment one):
 
     # 1. No emulation (normal operation)
-    asyncio.run(main())
+    #asyncio.run(main())
 
     # 2. Server-side emulation (affects ACKs back to client)
     # asyncio.run(main(
@@ -367,3 +372,12 @@ if __name__ == "__main__":
     #     jitter_ms=10,
     #     packet_loss_rate=0.0
     # ))
+
+    #DEMO TEST 4)
+    asyncio.run(main(
+        emulation_enabled=True,
+        delay_ms=10,
+        jitter_ms=20,
+        packet_loss_rate=0.15,
+        drop_sequences=set()
+    ))
