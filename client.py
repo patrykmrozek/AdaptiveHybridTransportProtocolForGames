@@ -104,7 +104,7 @@ class GameClientProtocol:
     # returns RTO between min and max defined above, scaled by latency and variability
     def RTO_ms(self):
         if self.srtt_ms is None:
-            return 1000
+            return 300
         rto = self.srtt_ms + 4 * self.rttvar_ms
         return max(self.RTO_min_ms, min(self.RTO_max_ms, int(rto)))
 
@@ -338,14 +338,12 @@ class GameClientProtocol:
         """
         reliable_period = 1.0 / reliable_hz
         unreliable_period = 1.0 / unreliable_hz
-        
         last_reliable_send = 0.0
         last_unreliable_send = 0.0
 
         try:
             while True:
                 now = time.time()
-                
                 # Check for reliable send opportunity
                 if now - last_reliable_send >= reliable_period:
                     # Randomly decide to send reliable (e.g., 50% chance when available)
@@ -380,12 +378,15 @@ class ClientEvents(QuicConnectionProtocol):
             try:
                 data_str = event.data.decode()
                 ack_seq = None
-                if data_str.startswith("{ack:"):
-                    try:
-                        ack_seq = json.loads(data_str)["ack"]
-                    except Exception as e:
-                        pass
-                elif data_str.startswith("ack:"):
+                #JSON ack
+                try:
+                    obj = json.loads(data_str)
+                    if isinstance(obj, dict) and "ack" in obj:
+                        ack_seq = obj["ack"]
+                except Exception as e:
+                    pass
+                #"ack" + original-pkt len
+                if ack_seq is None and data_str.startswith("ack:"):
                     try:
                         original_packet = json.loads(data_str[4:])
                         ack_seq = original_packet.get("seq")
@@ -562,7 +563,7 @@ asyncio.run(main(
     jitter_ms=80,
 ))
 
-    ## 4 a)) low loss - TEST_DISTURB_ACKS = False
+## 4 a)) low loss - TEST_DISTURB_ACKS = False
     asyncio.run(main(
         emulation_enabled=True,
         packet_loss_rate=0.01,
@@ -571,12 +572,12 @@ asyncio.run(main(
         drop_sequences=set(),
     ))
 
-    """
+"""
 # 4 b)) high loss - TEST_DISTURB_ACKS = False
-    asyncio.run(main(
-        emulation_enabled=True,
-        packet_loss_rate=0.15,
-        delay_ms=10,
-        jitter_ms=20,
-        drop_sequences=set(),
-    ))
+asyncio.run(main(
+    emulation_enabled=True,
+    packet_loss_rate=0.15,
+    delay_ms=10,
+    jitter_ms=20,
+    drop_sequences=set(),
+))
