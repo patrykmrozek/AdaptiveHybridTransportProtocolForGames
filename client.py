@@ -6,8 +6,6 @@ from typing import Optional, Dict
 from metrics import RollingStats, Jitter
 from dataclasses import dataclass
 
-from server import RELIABLE_TIMEOUT_MS
-
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -84,9 +82,11 @@ class GameClientProtocol:
         self.MAX_RETRIES = 5
 
         #storage for server rx counters
-        self._server_unrel_rx = 0
+        self._server_unrel_rx_total = 0
+        self._client_unrel_tx_total = 0
+        self._client_unrel_tx_prev = 0
         self._server_unrel_rx_prev = 0
-        self._server_unrel_tx_prev = 0
+        self._last_pdr_interval = float("nan")
 
         # Retransmission settings
         self._retransmit_timeout_ms = 100  # Initial timeout (will be updated based on RTT)
@@ -124,30 +124,31 @@ class GameClientProtocol:
            #update rtt est
             self.srtt_ms = (1-w1) * self.srtt_ms + w1 * sample_ms
 
-    def _print_metrics_summary(self):
+    def _print_metrics_summary(self, pdr_total_pct: float, pdr_interval_pct: float):
         now = time.time()
         dur = max(1e-6, now - self._start_time)
 
         r = self.metrics["reliable"]
         r_p = r["rtt"].percentiles()
         r_tput = r["bytes_tx"] / 1024.0 / dur
-        pdr = 100.0 * r["ack"] / max(1, r["tx"])
+        pr = 100.0 * r["ack"] / max(1, r["tx"])
+
         print("\n[client] 📊 ---- METRIC SUMMARY ----")
-        print(f"[metrics][RELIABLE] TX={r['tx']} ACK={r['ack']} RETX={r.get('retransmit', 0)} PDR={pdr:.1f}% BytesTX={r['bytes_tx']}")
-        if len(r["rtt"].samples) > 0:
-            print(f"    RTT(ms): avg={r['rtt'].avg():.2f} "
-                  f"p50={r_p.get(50, float('nan')):.2f} "
-                  f"p95={r_p.get(95, float('nan')):.2f} "
-                  f"jitter(RFC3550)={r['jitter'].value():.2f}")
+        print(
+            f"[metrics][RELIABLE] TX={r['tx']} ACK={r['ack']} RETX={r.get('retransmit', 0)} PDR={pr:.1f}% BytesTX={r['bytes_tx']}")
+        if r["rtt"].samples:
+            print(
+                f"    RTT(ms): avg={r['rtt'].avg():.2f} p50={r_p.get(50, float('nan')):.2f} p95={r_p.get(95, float('nan')):.2f} jitter(RFC3550)={r['jitter'].value():.2f}")
         else:
             print("    RTT(ms): No samples yet")
-        print(f"    Throughput ≈ {r_tput:.2f} kB/s")
+        print(f"    Throughput ≈ {r_tput} kB/s")
 
         u = self.metrics["unreliable"]
         u_tput = u["bytes_tx"] / 1024.0 / dur
-        u_pdr = 100.0 * self._server_unrel_rx / max(1, u["tx"])
-
-        print(f"[metrics][UNRELIABLE] TX={u['tx']} BytesTX={u['bytes_tx']} PDR={u_pdr:.1f}%")
+        print(f"[metrics][UNRELIABLE] TX={u['tx']} BytesTX={u['bytes_tx']} "
+              f"PDR(total)={pdr_total_pct:.1f}%"
+              + (f" PDR(interval)={pdr_interval_pct:.1f}%" if pdr_interval_pct is not None and not (
+                    pdr_interval_pct != pdr_interval_pct) else ""))
         print(f"    Throughput ≈ {u_tput:.2f} kB/s")
         print("[client] --------------------------\n")
 
@@ -222,6 +223,7 @@ class GameClientProtocol:
         datagram = make_dgram(msg_type=msg_type, channel=UNRELIABLE_CHANNEL, seq=seq, payload=payload)
 
         self.metrics["unreliable"]["tx"] += 1
+        self._client_unrel_tx_total = self.metrics["unreliable"]["tx"]
         self.metrics["unreliable"]["bytes_tx"] += len(datagram)
 
         self.quic.send_datagram_frame(datagram)
@@ -267,14 +269,7 @@ class GameClientProtocol:
             self.quic.send_stream_data(self.ctrl_stream_id, hello, end_stream=False)
             self.quic.send_stream_data(self.ctrl_stream_id, b'{"type":"metrics_reset"}', end_stream=False)
             await self.emulator.transmit(self.endpoint.transmit)
-            self._start_time = time.time()
-            self.metrics["reliable"]["tx"] = 0
-            self.metrics["reliable"]["ack"] = 0
-            self.metrics["reliable"]["bytes_tx"] = 0
-            self.metrics["unreliable"]["tx"] = 0
-            self.metrics["unreliable"]["bytes_tx"] = 0
-            self._server_unrel_rx_prev = 0
-            self._client_unrel_tx_prev = 0
+
 
         recv_task = asyncio.create_task(self._recv_loop())
         # Part f Randomized sending loop
@@ -383,83 +378,106 @@ class ClientEvents(QuicConnectionProtocol):
             # ready to send;
             pass
         elif isinstance(event, StreamDataReceived):
-            # Reliable data from server (echo ACK from server)
+            # Reliable data from server
             rx_ts = time.time()
-            data_str = None
-            try:
-                data_str = event.data.decode()
-                ack_seq = None
-                #JSON ack
+            data = event.data.decode(errors="ignore")
+
+            for data_str in data.splitlines():
+                if not data_str.strip():
+                    continue
                 try:
-                    obj = json.loads(data_str)
-                    if isinstance(obj, dict) and "ack" in obj:
-                        ack_seq = obj["ack"]
-                except Exception as e:
-                    pass
-                #"ack" + original-pkt len
-                if ack_seq is None and data_str.startswith("ack:"):
+                    obj = None
                     try:
-                        original_packet = json.loads(data_str[4:])
-                        ack_seq = original_packet.get("seq")
-                    except Exception as e:
-                        pass
-                if ack_seq is not None:
-                    # Parse the echoed reliable packet to get the original timestamp
-                    client = getattr(self, "metrics_client", None)
-                    if client is None and ack_seq is None:
-                        return
-                    if not hasattr(client, "_acked_seqs"):
-                        client._acked_seqs = set()
-                    if ack_seq in client._acked_seqs:
-                        return
-                    item = client._inflight.pop(ack_seq, None)
-                    client._acked_seqs.add(ack_seq)
+                        obj = json.loads(data_str)
+                    except Exception:
+                        obj = None
 
-                    if item is None:
-                        return
+                    if obj and obj.get("type") == "metrics_reset_ack":
+                        client = getattr(self, "metrics_client", None)
+                        if client:
+                            client._start_time = time.time()
+                            m = client.metrics
+                            m["reliable"]["tx"] = m["reliable"]["ack"] = m["reliable"]["bytes_tx"] = 0
+                            m["unreliable"]["tx"] = m["unreliable"]["bytes_tx"] = 0
+                            client._server_unrel_rx_prev = 0
+                            client._client_unrel_tx_prev = 0
+                            client._server_unrel_rx_total = 0
+                            client._client_unrel_tx_total = 0
+                            client._last_pdr_interval = float("nan")
+                        continue
 
-                    # Calculate RTT based on sender's original timestamp
-                    sent_ts = json.loads(item.payload_bytes.decode()).get("ts", rx_ts)
-                    rtt_ms = (rx_ts - sent_ts) * 1000.0
+                    ack_seq = None
+                    if obj and isinstance(obj, dict) and "ack" in obj:
+                        ack_seq = obj["ack"]
+                    if ack_seq is None and data_str.startswith("ack:"):
+                        try:
+                            original_packet = json.loads(data_str[4:])
+                            ack_seq = original_packet.get("seq")
+                        except Exception:
+                            pass
+                    if ack_seq is not None:
+                        client = getattr(self, "metrics_client", None)
+                        if not client:
+                            continue
+                        if not hasattr(client, "_acked_seqs"):
+                            client._acked_seqs = set()
+                        if ack_seq in client._acked_seqs:
+                            continue
+                        item = client._inflight.pop(ack_seq, None)
+                        client._acked_seqs.add(ack_seq)
+                        if item is None:
+                            continue
+                        sent_ts = json.loads(item.payload_bytes.decode()).get("ts", rx_ts)
+                        rtt_ms = (rx_ts - sent_ts) * 1000.0
+                        m = client.metrics["reliable"]
+                        m["ack"] += 1
+                        m["rtt"].add(rtt_ms)
+                        m["jitter"].add(rtt_ms)
+                        client._update_rtt(rtt_ms)
+                        print(f"[client] [Reliable] ACK RX: AppSeq={ack_seq}, RTT={rtt_ms:.2f}ms")
+                        continue
 
-                    m = client.metrics["reliable"]
-                    m["ack"] += 1
-                    m["rtt"].add(rtt_ms)
-                    m["jitter"].add(rtt_ms)
-                    client._update_rtt(rtt_ms)
-                    print(f"[client] [Reliable] ACK RX: AppSeq={ack_seq}, RTT={rtt_ms:.2f}ms")
-                    return
+                    if obj and obj.get("type") == "skip":
+                        client = getattr(self, "metrics_client", None)
+                        if client:
+                            skipped_seq = obj.get("seq")
+                            next_seq = obj.get("next_seq")
+                            client._inflight.pop(skipped_seq, None)
+                            print(
+                                f"[{get_timestamp()}] [client] ⚠️ EXPLICIT SKIP: Seq={skipped_seq} (next_seq={next_seq})")
+                        continue
 
-                pkt = json.loads(data_str)
-                if pkt.get("type") == "skip":
-                    # Server explicitly notified us that a packet was skipped
-                    skipped_seq = pkt.get("seq")
-                    next_seq = pkt.get("next_seq")
-                    client = getattr(self, "metrics_client", None)
-                    if client is not None:
-                        # Remove the explicitly skipped packet only
-                        # Don't infer other packets as skipped - they should be ACKed normally if they arrive
-                        skipped_info = client._inflight.pop(skipped_seq, None)
-                        if skipped_info:
-                            print(f"[{get_timestamp()}] [client] ⚠️ EXPLICIT SKIP: Seq={skipped_seq} skipped by server "
-                                  f"(next_seq={next_seq}). Retries={skipped_info.retries}")
-                    return
+                    if obj and obj.get("type") == "server_metrics":
+                        client = getattr(self, "metrics_client", None)
+                        if client:
+                            server_unrel_rx_now = int(obj.get("unrel_rx", 0))
+                            client_unrel_tx_now = client.metrics["unreliable"]["tx"]
+                            d_rx = server_unrel_rx_now - client._server_unrel_rx_prev
+                            d_tx = client_unrel_tx_now - client._client_unrel_tx_prev
+                            pdr_interval = 100.0 if d_tx <= 0 else max(0.0, min(100.0, 100.0 * d_rx / d_tx))
+                            client._server_unrel_rx_prev = server_unrel_rx_now
+                            client._client_unrel_tx_prev = client_unrel_tx_now
+                            client._last_pdr_interval = pdr_interval
+                            client._server_unrel_rx_total = server_unrel_rx_now
+                            client._client_unrel_tx_total = client_unrel_tx_now
+                            pdr_total = 100.0 * server_unrel_rx_now / max(1, client_unrel_tx_now)
 
-                if pkt.get("type") == "server_metrics":
-                    client = getattr(self, "metrics_client", None)
-                    if client:
-                        client._server_unrel_rx = int(pkt.get("unrel_rx", 0))
-                        client._server_rel_rx = int(pkt.get("rel_rx", 0))
-                        client._print_metrics_summary()
-                    return
+                            d_rx = server_unrel_rx_now - client._server_unrel_rx_prev
+                            d_tx = client_unrel_tx_now - client._client_unrel_tx_prev
+                            pdr_interval = 100.0 if d_tx <= 0 else max(0.0, min(100.0, 100.0 * d_rx / d_tx))
 
-                # Handle initial client_hello ACK or malformed data
-                if data_str and "client_hello" not in data_str:
-                    print(f"[{get_timestamp()}] [client] [Reliable] Data RX (non-JSON): {data_str[:100]!r}")
-            except Exception as e:
-                # Handle other exceptions
-                if data_str and "client_hello" not in data_str:
-                    print(f"[client] [Reliable] Data RX (exception): {event.data!r}, error: {e}")
+                            client._server_unrel_rx_prev = server_unrel_rx_now
+                            client._client_unrel_tx_prev = client_unrel_tx_now
+
+                            client._print_metrics_summary(pdr_total, pdr_interval)
+
+                        continue
+
+                    if "client_hello" not in data_str:
+                        print(f"[{get_timestamp()}] [client] [Reliable] Data RX (non-JSON): {data_str[:100]!r}")
+
+                except Exception as e:
+                    print(f"[client] handler error: {type(e).__name__}: {e}")
 
 
 async def main(host: str = "127.0.0.1", port: int = 4433,
@@ -544,7 +562,6 @@ if __name__ == "__main__":
     #     drop_sequences={5, 15}
     # ))
 
-
     """
     #demo test configs
     ## 1) baseline - TEST_DISTURB_ACKS = False
@@ -552,7 +569,6 @@ if __name__ == "__main__":
     asyncio.run(main(
         emulation_enabled=False,
     ))
-
 
 
         ## 2) retransmissions - TEST_DISTURB_ACKS = True
